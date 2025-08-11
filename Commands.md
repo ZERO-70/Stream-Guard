@@ -2,6 +2,23 @@
 
 This document provides ready-to-run commands to set up, configure, run, test, and maintain the project.
 
+
+### Quick start commands 
+
+### first start the sender
+
+source enviroment/bin/activate && python sender.py
+
+### then start the receiver
+
+## with no GUI (no video, see audio_transcript.txt for live results) :
+  
+source enviroment/bin/activate && python receiver.py --headless --enable-nsfw --enable-gun --enable-transcription --enable-profanity --whisper-model small
+
+## with GUI (with video) :
+    
+source enviroment/bin/activate && python receiver.py --enable-nsfw --enable-gun --enable-transcription --enable-profanity --whisper-model small
+
 ### Environment Setup
 
 ```bash

@@ -19,6 +19,8 @@ This project was created with the mutual contributions of ChatGPT, GitHub Copilo
 
 ## Quick Start
 
+### Please See Commands.md for configurable commands.
+
 ### Basic Setup
 ```bash
 # Install dependencies
@@ -289,6 +291,7 @@ def blur_frame(self, frame, blur_strength=50):  # Increase for more blur
 ## License
 
 This project is open source and available under the MIT License.
+
 
 ### Contributing
 
