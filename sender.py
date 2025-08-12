@@ -166,12 +166,17 @@ class VideoSender:
             sys.exit(1)
         
         # Get video properties
-        fps = cap.get(cv2.CAP_PROP_FPS)
+        source_fps = cap.get(cv2.CAP_PROP_FPS)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        frame_delay = 1.0 / fps if fps > 0 else 0.033
-        self.video_duration = total_frames / fps if fps > 0 else 0
+        # Use configured target FPS if provided; fall back to source FPS
+        configured_fps = self.config.get('video', 'target_fps')
+        target_fps = float(configured_fps) if configured_fps else (float(source_fps) if source_fps and source_fps > 0 else 24.0)
+        frame_delay = 1.0 / target_fps
+        # Duration is based on source fps if available
+        self.video_duration = (total_frames / float(source_fps)) if source_fps and source_fps > 0 else (total_frames * frame_delay)
         
-        print(f"Video FPS: {fps}")
+        print(f"Video FPS (source): {source_fps}")
+        print(f"Target playback FPS: {target_fps}")
         print(f"Video duration: {self.video_duration:.2f} seconds")
         print(f"Frame delay: {frame_delay:.3f} seconds")
         print("Starting video and audio streams...")
@@ -202,12 +207,33 @@ class VideoSender:
                 
                 # Stream one complete video loop
                 while True:
+                    # Maintain a constant frame rate by skipping/dropping frames when behind schedule
+                    elapsed_since_loop = time.time() - loop_start_time
+                    expected_index = int(elapsed_since_loop / frame_delay)
+
+                    # If we're behind, jump ahead to the expected frame index to keep real-time pace
+                    if expected_index > frame_count:
+                        # Fast seek to the expected frame index (drop frames)
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, min(expected_index, total_frames - 1))
+                        frame_count = expected_index
+
                     ret, frame = cap.read()
                     if not ret:
                         # End of video reached
                         print(f"Video loop #{loop_count + 1} completed")
                         break
                     
+                    # Optional: downscale to reduce bandwidth/CPU if configured
+                    try:
+                        scale_factor = self.config.get('video', 'scale_factor')
+                        if scale_factor and float(scale_factor) > 0 and float(scale_factor) != 1.0:
+                            frame = cv2.resize(
+                                frame,
+                                (int(frame.shape[1] * float(scale_factor)), int(frame.shape[0] * float(scale_factor)))
+                            )
+                    except Exception:
+                        pass
+
                     # Encode frame as JPEG with quality from config
                     jpeg_quality = self.config.get('video', 'jpeg_quality')
                     encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality]
@@ -224,12 +250,11 @@ class VideoSender:
                         
                         frame_count += 1
                         
-                        # Maintain real-time playback speed
+                        # Maintain real-time playback schedule for next frame
                         elapsed_time = time.time() - loop_start_time
-                        expected_time = frame_count * frame_delay
-                        
-                        if expected_time > elapsed_time:
-                            time.sleep(expected_time - elapsed_time)
+                        next_frame_time = frame_count * frame_delay
+                        if next_frame_time > elapsed_time:
+                            time.sleep(next_frame_time - elapsed_time)
                         
                     except (socket.error, ConnectionResetError):
                         print("Client disconnected")

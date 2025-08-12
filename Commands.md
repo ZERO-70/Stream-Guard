@@ -15,6 +15,8 @@ source enviroment/bin/activate && python sender.py
   
 source enviroment/bin/activate && python receiver.py --headless --enable-nsfw --enable-gun --enable-transcription --enable-profanity --whisper-model small
 
+source enviroment/bin/activate && python receiver.py --no-nsfw --no-gun --no-transcription --no-profanity 
+
 ## with GUI (with video) :
     
 source enviroment/bin/activate && python receiver.py --enable-nsfw --enable-gun --enable-transcription --enable-profanity --whisper-model small

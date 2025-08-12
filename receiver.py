@@ -92,6 +92,11 @@ class VideoReceiver:
         self.audio_delay_compensation = self.config.get('audio_sync', 'delay_compensation') if self.config.get('audio_sync') else 0.0
         self.max_compensation = 0.1  # Maximum compensation allowed (100ms)
         
+        # Video receive/display buffering
+        self.video_frame_queue = queue.Queue(maxsize=60)  # buffer of most recent frames
+        self.video_running = False
+        self.video_reader_thread = None
+        
         # Initialize NSFW detection based on config
         self.nsfw_detection_available = False
         if self.config.is_enabled('nsfw_detection'):
@@ -385,7 +390,11 @@ class VideoReceiver:
         # Load profanity words from external dataset
         self.profanity_words = []
         
-        # Check if profanity filtering is enabled
+        # Real-time abusive word detection (always initialize these attributes)
+        self.abusive_words_detected = []  # Store recently detected words
+        self.last_abusive_check_time = time.time()
+        
+        # Only proceed with profanity filter setup if enabled
         if not self.config.is_enabled('profanity_filter'):
             #logger.info("Profanity filtering disabled by configuration")
             return
@@ -423,10 +432,6 @@ class VideoReceiver:
         # Use word boundaries to avoid partial matches
         pattern = r'\b(' + '|'.join(re.escape(word) for word in self.profanity_words) + r')\b'
         self.profanity_pattern = re.compile(pattern, re.IGNORECASE)
-        
-        # Real-time abusive word detection
-        self.abusive_words_detected = []  # Store recently detected words
-        self.last_abusive_check_time = time.time()
         
         #logger.info(f"Profanity filter initialized with {len(self.profanity_words)} words")
         logger.info("Real-time abusive language detection enabled")
@@ -1164,7 +1169,7 @@ class VideoReceiver:
         if self.current_nsfw_status:
             # Increase scaled by confidence and intensity factor 2
             nsfw_conf = max(0.0, min(1.0, float(self.nsfw_confidence)))
-            increase = (self.temperature_increase_rate * time_elapsed) * 2.0 * nsfw_conf
+            increase = (self.temperature_increase_rate * time_elapsed) * 100.0 * nsfw_conf
             self.nsfw_temperature = min(100.0, self.nsfw_temperature + increase)
             # logger.info(f"NSFW detected - +{increase:.2f} (conf={nsfw_conf:.2f}) -> {self.nsfw_temperature:.1f}")
         else:
@@ -1180,7 +1185,7 @@ class VideoReceiver:
         if self.current_gun_status:
             # Increase scaled by confidence and intensity factor 2
             gun_conf = max(0.0, min(1.0, float(self.gun_confidence)))
-            increase = (self.temperature_increase_rate * time_elapsed) * 2.0 * gun_conf
+            increase = (self.temperature_increase_rate * time_elapsed) * 100.0 * gun_conf
             self.arm_temperature = min(100.0, self.arm_temperature + increase)
             # logger.info(f"Weapon detected - +{increase:.2f} (conf={gun_conf:.2f}) -> {self.arm_temperature:.1f}")
         else:
@@ -1341,6 +1346,45 @@ class VideoReceiver:
             #logger.error(f"Error in draw_gun_boxes: {e}")
             return frame  # Return original frame if there's an error
     
+    def draw_icon(self, frame, x, y, icon_type, color, size=20):
+        """Draw simple icons for different detection types"""
+        if icon_type == "nsfw":
+            # Draw a simple eye icon (circle with inner circle)
+            cv2.circle(frame, (x + size//2, y + size//2), size//2, color, 2)
+            cv2.circle(frame, (x + size//2, y + size//2), size//4, color, -1)
+        elif icon_type == "weapon":
+            # Draw a simple crosshair icon
+            cv2.line(frame, (x, y + size//2), (x + size, y + size//2), color, 2)
+            cv2.line(frame, (x + size//2, y), (x + size//2, y + size), color, 2)
+            cv2.circle(frame, (x + size//2, y + size//2), size//3, color, 2)
+        elif icon_type == "abusive":
+            # Draw a simple speech bubble icon
+            cv2.ellipse(frame, (x + size//2, y + size//2), (size//2, size//3), 0, 0, 360, color, 2)
+            cv2.line(frame, (x + size//2, y + size), (x + size//2 + size//4, y + size + size//4), color, 2)
+        elif icon_type == "fps":
+            # Draw a simple speedometer icon
+            cv2.circle(frame, (x + size//2, y + size//2), size//2, color, 2)
+            cv2.line(frame, (x + size//2, y + size//2), (x + size, y + size//2), color, 2)
+        elif icon_type == "overall":
+            # Draw a shield icon for overall threat level
+            # Draw shield outline
+            shield_points = [
+                (x + size//2, y),  # top
+                (x + size - 2, y + size//3),  # top right
+                (x + size - 2, y + 2*size//3),  # bottom right
+                (x + size//2, y + size),  # bottom
+                (x + 2, y + 2*size//3),  # bottom left
+                (x + 2, y + size//3)  # top left
+            ]
+            cv2.polylines(frame, [np.array(shield_points)], True, color, 2)
+            # Add warning symbol inside (exclamation mark)
+            cv2.line(frame, (x + size//2, y + size//4), (x + size//2, y + size//2), color, 2)
+            cv2.circle(frame, (x + size//2, y + 3*size//4), 1, color, -1)
+        elif icon_type == "sync":
+            # Draw a simple sync icon (two arrows)
+            cv2.arrowedLine(frame, (x, y + size//2), (x + size//2, y + size//2), color, 2, tipLength=0.3)
+            cv2.arrowedLine(frame, (x + size//2, y + size//2), (x + size, y + size//2), color, 2, tipLength=0.3)
+
     def receive_video(self):
         """Receive and display video frames"""
         data = b""
@@ -1399,8 +1443,12 @@ class VideoReceiver:
         
         frame_count = 0
         start_time = cv2.getTickCount()
-        # For frame rate control
-        target_fps = 24  # Fixed to match original video's 24 FPS
+        # For frame rate control (use configured target FPS)
+        configured_fps = self.config.get('video', 'target_fps')
+        try:
+            target_fps = float(configured_fps) if configured_fps else 24.0
+        except Exception:
+            target_fps = 24.0
         frame_time = 1.0 / target_fps
         last_frame_time = time.time()
         
@@ -1429,7 +1477,11 @@ class VideoReceiver:
                     if frame is not None:
                         frame_count += 1
                         current_time = time.time()
-
+                        
+                        # Debug: Print frame info every 30 frames
+                        if frame_count % 30 == 0:
+                            print(f"Frame {frame_count}: shape={frame.shape}, dtype={frame.dtype}")
+                        
                         # Initialize or reinitialize base timestamp for synchronization at loop boundaries
                         with self.sync_lock:
                             if self.base_timestamp is None:
@@ -1537,233 +1589,325 @@ class VideoReceiver:
                         
                         # Skip video display and related processing in headless mode
                         if not self.headless_mode:
-                        
-                            # Calculate and display FPS
-                            current_tick = cv2.getTickCount()
-                            elapsed_time = (current_tick - start_time) / cv2.getTickFrequency()
-                            fps = frame_count / elapsed_time if elapsed_time > 0 else 0
-                            
-                            # === UPPER LEFT: TEMPERATURE DISPLAYS ===
-                            temp_start_y = 30
-                            temp_spacing = 30
-                            current_temp_y = temp_start_y
-                            
-                            # NSFW Temperature Display
-                            if self.nsfw_detection_available:
-                                # Display NSFW Temperature with color coding
-                                temp_color = (0, 255, 0)  # Green for safe
-                                if self.nsfw_temperature > 50:
-                                    temp_color = (0, 165, 255)  # Orange for warning
-                                if self.nsfw_temperature > 75:
-                                    temp_color = (0, 0, 255)  # Red for danger
+                            try:
+                                # Calculate and display FPS
+                                current_tick = cv2.getTickCount()
+                                elapsed_time = (current_tick - start_time) / cv2.getTickFrequency()
+                                fps = frame_count / elapsed_time if elapsed_time > 0 else 0
                                 
-                                cv2.putText(frame, f"NSFW Temp: {self.nsfw_temperature:.1f}°", (10, current_temp_y), 
-                                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, temp_color, 2)
+                                # === UPPER LEFT: TEMPERATURE DISPLAYS ===
+                                temp_start_y = 40
+                                temp_spacing = 60  # Increased spacing between temperature rows to prevent overlap
+                                current_temp_y = temp_start_y
+                                icon_size = 24
+                                icon_margin = 15  # Space between icon and text
+                                text_bar_spacing = 8  # Small space between text and bar
                                 
-                                # Draw NSFW temperature bar
-                                bar_x, bar_y = 200, current_temp_y - 15
-                                bar_width, bar_height = 150, 15
-                                # Background bar
-                                cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (50, 50, 50), -1)
-                                # Temperature fill
-                                fill_width = int((self.nsfw_temperature / 100.0) * bar_width)
-                                cv2.rectangle(frame, (bar_x, bar_y), (bar_x + fill_width, bar_y + bar_height), temp_color, -1)
-                                # Border
-                                cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (255, 255, 255), 1)
-                                current_temp_y += temp_spacing
-                            
-                            # Weapon Temperature Display
-                            if self.gun_detection_available:
-                                # Display Weapon Temperature with color coding
-                                temp_color = (0, 255, 0)  # Green for safe
-                                if self.arm_temperature > 50:
-                                    temp_color = (0, 165, 255)  # Orange for warning
-                                if self.arm_temperature > 75:
-                                    temp_color = (0, 0, 255)  # Red for danger
+                                # NSFW Temperature Display
+                                if self.nsfw_detection_available:
+                                    # Determine color first before using it
+                                    temp_color = (0, 255, 0)  # Green for safe
+                                    if self.nsfw_temperature > 50:
+                                        temp_color = (0, 165, 255)  # Orange for warning
+                                    if self.nsfw_temperature > 75:
+                                        temp_color = (0, 0, 255)  # Red for danger
+                                    
+                                    # Draw NSFW icon
+                                    icon_x = 15
+                                    icon_y = current_temp_y - icon_size//2
+                                    self.draw_icon(frame, icon_x, icon_y, "nsfw", temp_color, icon_size)
+                                    
+                                    # Draw NSFW text
+                                    text_x = icon_x + icon_size + icon_margin
+                                    cv2.putText(frame, f"NSFW: {self.nsfw_temperature:.1f}%", (text_x, current_temp_y), 
+                                               cv2.FONT_HERSHEY_DUPLEX, 0.8, temp_color, 2)
+                                    
+                                    # Draw temperature bar BELOW the text
+                                    bar_x = text_x
+                                    bar_y = current_temp_y + text_bar_spacing  # Position bar below text
+                                    bar_width = 200
+                                    bar_height = 25
+                                    # Draw bar background
+                                    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (200, 200, 200), 2)
+                                    # Draw temperature fill
+                                    fill_width = int((self.nsfw_temperature / 100.0) * bar_width)
+                                    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + fill_width, bar_y + bar_height), temp_color, -1)
+                                    
+                                    current_temp_y += temp_spacing
                                 
-                                cv2.putText(frame, f"Weapon Temp: {self.arm_temperature:.1f}°", (10, current_temp_y), 
-                                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, temp_color, 2)
+                                # Weapon Temperature Display
+                                if self.gun_detection_available:
+                                    # Determine color first before using it
+                                    temp_color = (0, 255, 0)  # Green for safe
+                                    if self.arm_temperature > 50:
+                                        temp_color = (0, 165, 255)  # Orange for warning
+                                    if self.arm_temperature > 75:
+                                        temp_color = (0, 0, 255)  # Red for danger
+                                    
+                                    # Draw Weapon icon
+                                    icon_x = 15
+                                    icon_y = current_temp_y - icon_size//2
+                                    self.draw_icon(frame, icon_x, icon_y, "weapon", temp_color, icon_size)
+                                    
+                                    # Draw Weapon text
+                                    text_x = icon_x + icon_size + icon_margin
+                                    cv2.putText(frame, f"Weapon: {self.arm_temperature:.1f}%", (text_x, current_temp_y), 
+                                               cv2.FONT_HERSHEY_DUPLEX, 0.8, temp_color, 2)
+                                    
+                                    # Draw temperature bar BELOW the text
+                                    bar_x = text_x
+                                    bar_y = current_temp_y + text_bar_spacing  # Position bar below text
+                                    bar_width = 200
+                                    bar_height = 25
+                                    # Draw bar background
+                                    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (200, 200, 200), 2)
+                                    # Draw temperature fill
+                                    fill_width = int((self.arm_temperature / 100.0) * bar_width)
+                                    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + fill_width, bar_y + bar_height), temp_color, -1)
+                                    
+                                    current_temp_y += temp_spacing
                                 
-                                # Draw Weapon temperature bar
-                                bar_x, bar_y = 200, current_temp_y - 15
-                                bar_width, bar_height = 150, 15
-                                # Background bar
-                                cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (50, 50, 50), -1)
-                                # Temperature fill
-                                fill_width = int((self.arm_temperature / 100.0) * bar_width)
-                                cv2.rectangle(frame, (bar_x, bar_y), (bar_x + fill_width, bar_y + bar_height), temp_color, -1)
-                                # Border
-                                cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (255, 255, 255), 1)
-                                current_temp_y += temp_spacing
-                            
-                            # Abusive Language Temperature Display
-                            if self.transcription_available:
-                                # Display Abusive Language Temperature with color coding
-                                temp_color = (0, 255, 0)  # Green for safe
-                                if self.abusive_language_temperature > 30:
-                                    temp_color = (0, 165, 255)  # Orange for warning
-                                if self.abusive_language_temperature > 60:
-                                    temp_color = (0, 0, 255)  # Red for danger
+                                # Abusive Language Temperature Display
+                                if self.transcription_available and self.config.is_enabled('profanity_filter'):
+                                    # Determine color first before using it
+                                    temp_color = (0, 255, 0)  # Green for safe
+                                    if self.abusive_language_temperature > 50:
+                                        temp_color = (0, 165, 255)  # Orange for warning
+                                    if self.abusive_language_temperature > 75:
+                                        temp_color = (0, 0, 255)  # Red for danger
+                                    
+                                    # Draw Abusive icon
+                                    icon_x = 15
+                                    icon_y = current_temp_y - icon_size//2
+                                    self.draw_icon(frame, icon_x, icon_y, "abusive", temp_color, icon_size)
+                                    
+                                    # Draw Abusive text
+                                    text_x = icon_x + icon_size + icon_margin
+                                    cv2.putText(frame, f"Abusive: {self.abusive_language_temperature:.1f}%", (text_x, current_temp_y), 
+                                               cv2.FONT_HERSHEY_DUPLEX, 0.8, temp_color, 2)
+                                    
+                                    # Draw temperature bar BELOW the text
+                                    bar_x = text_x
+                                    bar_y = current_temp_y + text_bar_spacing  # Position bar below text
+                                    bar_width = 200
+                                    bar_height = 25
+                                    # Draw bar background
+                                    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (200, 200, 200), 2)
+                                    # Draw temperature fill
+                                    fill_width = int((self.abusive_language_temperature / 100.0) * bar_width)
+                                    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + fill_width, bar_y + bar_height), temp_color, -1)
+                                    
+                                    current_temp_y += temp_spacing
                                 
-                                cv2.putText(frame, f"Abusive Temp: {self.abusive_language_temperature:.1f}°", (10, current_temp_y), 
-                                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, temp_color, 2)
+                                # === OVERALL THREAT LEVEL ===
+                                # Calculate overall threat level as maximum of all enabled temperatures
+                                enabled_temperatures = []
+                                if self.nsfw_detection_available:
+                                    enabled_temperatures.append(self.nsfw_temperature)
+                                if self.gun_detection_available:
+                                    enabled_temperatures.append(self.arm_temperature)
+                                if self.transcription_available and self.config.is_enabled('profanity_filter'):
+                                    enabled_temperatures.append(self.abusive_language_temperature)
                                 
-                                # Draw Abusive Language temperature bar
-                                bar_x, bar_y = 200, current_temp_y - 15
-                                bar_width, bar_height = 150, 15
-                                # Background bar
-                                cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (50, 50, 50), -1)
-                                # Temperature fill
-                                fill_width = int((self.abusive_language_temperature / 100.0) * bar_width)
-                                cv2.rectangle(frame, (bar_x, bar_y), (bar_x + fill_width, bar_y + bar_height), temp_color, -1)
-                                # Border
-                                cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (255, 255, 255), 1)
-                                current_temp_y += temp_spacing
-                            
-                            # === UPPER RIGHT: TEXT INFO AND STATUS ===
-                            info_start_x = frame.shape[1] - 300
-                            info_start_y = 30
-                            info_spacing = 25
-                            current_info_y = info_start_y
-                            
-                            # Performance Info
-                            cv2.putText(frame, f"FPS: {fps:.1f}", (info_start_x, current_info_y), 
-                                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                            current_info_y += info_spacing
-                            
-                            cv2.putText(frame, f"Frames: {frame_count}", (info_start_x, current_info_y), 
-                                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                            current_info_y += info_spacing
-                            
-                            # NSFW Detection Status
-                            if self.nsfw_detection_available:
-                                if self.current_nsfw_status:
-                                    cv2.putText(frame, f"NSFW: {self.nsfw_confidence:.2f}", (info_start_x, current_info_y), 
-                                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                                # Only show overall temperature if at least one individual temperature is enabled
+                                if enabled_temperatures:
+                                    overall_temperature = max(enabled_temperatures)
+                                    
+                                    # Determine color based on overall temperature
+                                    temp_color = (0, 255, 0)  # Green for safe
+                                    if overall_temperature > 50:
+                                        temp_color = (0, 165, 255)  # Orange for warning
+                                    if overall_temperature > 75:
+                                        temp_color = (0, 0, 255)  # Red for danger
+                                    
+                                    # Draw Overall threat icon
+                                    icon_x = 15
+                                    icon_y = current_temp_y - icon_size//2
+                                    self.draw_icon(frame, icon_x, icon_y, "overall", temp_color, icon_size)
+                                    
+                                    # Draw Overall threat text
+                                    text_x = icon_x + icon_size + icon_margin
+                                    cv2.putText(frame, f"Overall: {overall_temperature:.1f}%", (text_x, current_temp_y), 
+                                               cv2.FONT_HERSHEY_DUPLEX, 0.8, temp_color, 2)
+                                    
+                                    # Draw temperature bar BELOW the text
+                                    bar_x = text_x
+                                    bar_y = current_temp_y + text_bar_spacing  # Position bar below text
+                                    bar_width = 200
+                                    bar_height = 25
+                                    # Draw bar background
+                                    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (200, 200, 200), 2)
+                                    # Draw temperature fill
+                                    fill_width = int((overall_temperature / 100.0) * bar_width)
+                                    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + fill_width, bar_y + bar_height), temp_color, -1)
+                                    
+                                    current_temp_y += temp_spacing
+                                
+                                # === UPPER RIGHT: TEXT INFO AND STATUS ===
+                                info_start_x = frame.shape[1] - 320  # Slightly wider for better spacing
+                                info_start_y = 40
+                                info_spacing = 30  # Increased spacing
+                                current_info_y = info_start_y
+                                
+                                # Performance Info with icon
+                                icon_x = info_start_x - 30
+                                icon_y = current_info_y - 12
+                                self.draw_icon(frame, icon_x, icon_y, "fps", (0, 255, 0), 20)
+                                cv2.putText(frame, f"FPS: {fps:.1f}", (info_start_x, current_info_y), 
+                                           cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 255, 0), 2)
+                                current_info_y += info_spacing
+                                
+                                cv2.putText(frame, f"Frames: {frame_count}", (info_start_x, current_info_y), 
+                                           cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 255, 0), 2)
+                                current_info_y += info_spacing
+                                
+                                # NSFW Detection Status
+                                if self.nsfw_detection_available:
+                                    if self.current_nsfw_status:
+                                        cv2.putText(frame, f"NSFW: {self.nsfw_confidence:.2f}", (info_start_x, current_info_y), 
+                                                   cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 0, 255), 2)
+                                        current_info_y += info_spacing
+                                        cv2.putText(frame, "BLURRED", (info_start_x, current_info_y), 
+                                                   cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 0, 255), 2)
+                                    else:
+                                        cv2.putText(frame, f"SFW: {self.nsfw_confidence:.2f}", (info_start_x, current_info_y), 
+                                                   cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 255, 0), 2)
                                     current_info_y += info_spacing
-                                    cv2.putText(frame, "BLURRED", (info_start_x, current_info_y), 
-                                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
                                 else:
-                                    cv2.putText(frame, f"SFW: {self.nsfw_confidence:.2f}", (info_start_x, current_info_y), 
-                                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                                current_info_y += info_spacing
-                            else:
-                                cv2.putText(frame, "NSFW: Disabled", (info_start_x, current_info_y), 
-                                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (128, 128, 128), 2)
-                                current_info_y += info_spacing
-                            
-                            # Gun Detection Status
-                            if self.gun_detection_available:
-                                if self.current_gun_status:
-                                    cv2.putText(frame, f"WEAPON: {self.gun_confidence:.2f}", (info_start_x, current_info_y), 
-                                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                                    cv2.putText(frame, "NSFW: Disabled", (info_start_x, current_info_y), 
+                                               cv2.FONT_HERSHEY_DUPLEX, 0.7, (128, 128, 128), 2)
                                     current_info_y += info_spacing
-                                    cv2.putText(frame, f"Objects: {len(self.gun_objects)}", (info_start_x, current_info_y), 
-                                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-                                else:
-                                    cv2.putText(frame, "No weapons detected", (info_start_x, current_info_y), 
-                                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                                current_info_y += info_spacing
-                            else:
-                                cv2.putText(frame, "Weapon: Disabled", (info_start_x, current_info_y), 
-                                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (128, 128, 128), 2)
-                                current_info_y += info_spacing
-                            
-                            # Show recently detected abusive words (if available)
-                            if self.transcription_available and self.abusive_words_detected:
-                                recent_words = self.abusive_words_detected[-3:]  # Last 3 words to fit better
-                                words_text = "Recent: " + ", ".join([f"*{word}*" for word in recent_words])
-                                cv2.putText(frame, words_text[:40], (info_start_x, current_info_y), 
-                                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-                                current_info_y += info_spacing
-                            
-                            # Display live subtitles at the bottom of the frame
-                            if self.transcription_available:
-                                current_time = time.time()
-                                with self.transcription_lock:
-                                    # Check if we should still display the current subtitle
-                                    if current_time - self.last_subtitle_time <= self.subtitle_display_time and self.current_subtitle:
-                                        # Get frame dimensions
-                                        frame_height, frame_width = frame.shape[:2]
-                                        
-                                        # Subtitle settings
-                                        subtitle_text = self.current_subtitle
-                                        font = cv2.FONT_HERSHEY_SIMPLEX
-                                        font_scale = 0.8
-                                        thickness = 2
-                                        
-                                        # Split long text into multiple lines
-                                        max_chars_per_line = 60
-                                        words = subtitle_text.split()
-                                        lines = []
-                                        current_line = ""
-                                        
-                                        for word in words:
-                                            if len(current_line + " " + word) <= max_chars_per_line:
-                                                current_line += " " + word if current_line else word
-                                            else:
-                                                if current_line:
-                                                    lines.append(current_line)
-                                                current_line = word
-                                        
-                                        if current_line:
-                                            lines.append(current_line)
-                                        
-                                        # Display subtitle lines
-                                        y_offset = frame_height - 60
-                                        for i, line in enumerate(reversed(lines[-3:])):  # Show max 3 lines
-                                            # Get text size for background rectangle
-                                            (text_width, text_height), baseline = cv2.getTextSize(line, font, font_scale, thickness)
-                                            
-                                            # Calculate position (center horizontally)
-                                            x_pos = (frame_width - text_width) // 2
-                                            y_pos = y_offset - (i * (text_height + 10))
-                                            
-                                            # Draw background rectangle
-                                            cv2.rectangle(frame, 
-                                                        (x_pos - 10, y_pos - text_height - 5),
-                                                        (x_pos + text_width + 10, y_pos + baseline + 5),
-                                                        (0, 0, 0), -1)  # Black background
-                                            
-                                            # Draw subtitle text
-                                            cv2.putText(frame, line, (x_pos, y_pos), 
-                                                       font, font_scale, (255, 255, 255), thickness)
-                            
-                            # Add transcription status indicator (moved to upper right info section)
-                            if self.transcription_available:
-                                cv2.putText(frame, "Transcription: ON", (info_start_x, current_info_y), 
-                                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-                            else:
-                                cv2.putText(frame, "Transcription: OFF", (info_start_x, current_info_y), 
-                                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (128, 128, 128), 2)
-                            current_info_y += info_spacing
-                            
-                            # Add synchronization status indicator (moved to upper right info section)
-                            if self.sync_enabled:
-                                sync_color = (0, 255, 0)  # Green for good sync
-                                if abs(self.audio_delay_compensation) > 0.05:
-                                    sync_color = (0, 165, 255)  # Orange for moderate drift
-                                if abs(self.audio_delay_compensation) > 0.1:
-                                    sync_color = (0, 0, 255)  # Red for significant drift
                                 
-                                sync_text = f"Sync: {self.audio_delay_compensation:+.3f}s"
-                                cv2.putText(frame, sync_text, (info_start_x, current_info_y), 
-                                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, sync_color, 2)
-                            else:
-                                cv2.putText(frame, "Sync: OFF", (info_start_x, current_info_y), 
-                                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (128, 128, 128), 2)
-                            
-                            # Resize frame to fit better on laptop screens
-                            # Use a scale factor to make the window smaller
-                            scale_factor = 0.9  # Reduce to 90% of original size
-                            display_width = int(frame.shape[1] * scale_factor)
-                            display_height = int(frame.shape[0] * scale_factor)
-                            display_frame = cv2.resize(frame, (display_width, display_height))
-                            
-                            # Display resized frame
-                            cv2.imshow('Video Stream', display_frame)
+                                # Gun Detection Status
+                                if self.gun_detection_available:
+                                    if self.current_gun_status:
+                                        cv2.putText(frame, f"WEAPON: {self.gun_confidence:.2f}", (info_start_x, current_info_y), 
+                                                   cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 0, 255), 2)
+                                        current_info_y += info_spacing
+                                        cv2.putText(frame, f"Objects: {len(self.gun_objects)}", (info_start_x, current_info_y), 
+                                                   cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 0, 255), 2)
+                                    else:
+                                        cv2.putText(frame, "No weapons detected", (info_start_x, current_info_y), 
+                                                   cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 255, 0), 2)
+                                    current_info_y += info_spacing
+                                else:
+                                    cv2.putText(frame, "Weapon: Disabled", (info_start_x, current_info_y), 
+                                               cv2.FONT_HERSHEY_DUPLEX, 0.7, (128, 128, 128), 2)
+                                    current_info_y += info_spacing
+                                
+                                # Show recently detected abusive words (if available)
+                                if self.transcription_available and self.abusive_words_detected:
+                                    recent_words = self.abusive_words_detected[-3:]  # Last 3 words to fit better
+                                    words_text = "Recent: " + ", ".join([f"*{word}*" for word in recent_words])
+                                    cv2.putText(frame, words_text[:40], (info_start_x, current_info_y), 
+                                               cv2.FONT_HERSHEY_DUPLEX, 0.6, (255, 255, 0), 2)
+                                    current_info_y += info_spacing
+                                
+                                # Display live subtitles at the bottom of the frame
+                                if self.transcription_available:
+                                    current_time = time.time()
+                                    with self.transcription_lock:
+                                        # Check if we should still display the current subtitle
+                                        if current_time - self.last_subtitle_time <= self.subtitle_display_time and self.current_subtitle:
+                                            # Get frame dimensions
+                                            frame_height, frame_width = frame.shape[:2]
+                                            
+                                            # Subtitle settings
+                                            subtitle_text = self.current_subtitle
+                                            font = cv2.FONT_HERSHEY_DUPLEX  # Better font for subtitles
+                                            font_scale = 0.9  # Slightly larger
+                                            thickness = 2
+                                            
+                                            # Split long text into multiple lines
+                                            max_chars_per_line = 60
+                                            words = subtitle_text.split()
+                                            lines = []
+                                            current_line = ""
+                                            
+                                            for word in words:
+                                                if len(current_line + " " + word) <= max_chars_per_line:
+                                                    current_line += " " + word if current_line else word
+                                                else:
+                                                    if current_line:
+                                                        lines.append(current_line)
+                                                    current_line = word
+                                            
+                                            if current_line:
+                                                lines.append(current_line)
+                                            
+                                            # Display subtitle lines
+                                            y_offset = frame_height - 80  # Moved up slightly
+                                            for i, line in enumerate(reversed(lines[-3:])):  # Show max 3 lines
+                                                # Get text size for background rectangle
+                                                (text_width, text_height), baseline = cv2.getTextSize(line, font, font_scale, thickness)
+                                                
+                                                # Calculate position (center horizontally)
+                                                x_pos = (frame_width - text_width) // 2
+                                                y_pos = y_offset - (i * (text_height + 15))  # Increased line spacing
+                                                
+                                                # Draw background rectangle with better styling
+                                                cv2.rectangle(frame, 
+                                                            (x_pos - 15, y_pos - text_height - 8),
+                                                            (x_pos + text_width + 15, y_pos + baseline + 8),
+                                                            (0, 0, 0), -1)  # Black background
+                                                
+                                                # Draw subtitle text with better contrast
+                                                cv2.putText(frame, line, (x_pos, y_pos), 
+                                                           font, font_scale, (255, 255, 255), thickness)
+                                
+                                # Add transcription status indicator (moved to upper right info section)
+                                if self.transcription_available:
+                                    # Draw transcription icon
+                                    icon_x = info_start_x - 30
+                                    icon_y = current_info_y - 12
+                                    self.draw_icon(frame, icon_x, icon_y, "abusive", (0, 255, 255), 20)
+                                    cv2.putText(frame, "Transcription: ON", (info_start_x, current_info_y), 
+                                               cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 255, 255), 2)
+                                else:
+                                    cv2.putText(frame, "Transcription: OFF", (info_start_x, current_info_y), 
+                                               cv2.FONT_HERSHEY_DUPLEX, 0.7, (128, 128, 128), 2)
+                                current_info_y += info_spacing
+                                
+                                # Add synchronization status indicator (moved to upper right info section)
+                                if self.sync_enabled:
+                                    # Draw sync icon
+                                    icon_x = info_start_x - 30
+                                    icon_y = current_info_y - 12
+                                    sync_color = (0, 255, 0)  # Green for good sync
+                                    if abs(self.audio_delay_compensation) > 0.05:
+                                        sync_color = (0, 165, 255)  # Orange for moderate drift
+                                    if abs(self.audio_delay_compensation) > 0.1:
+                                        sync_color = (0, 0, 255)  # Red for significant drift
+                                    
+                                    self.draw_icon(frame, icon_x, icon_y, "sync", sync_color, 20)
+                                    sync_text = f"Sync: {self.audio_delay_compensation:+.3f}s"
+                                    cv2.putText(frame, sync_text, (info_start_x, current_info_y), 
+                                               cv2.FONT_HERSHEY_DUPLEX, 0.7, sync_color, 2)
+                                else:
+                                    cv2.putText(frame, "Sync: OFF", (info_start_x, current_info_y), 
+                                               cv2.FONT_HERSHEY_DUPLEX, 0.7, (128, 128, 128), 2)
+                                
+                                # Resize frame to fit better on laptop screens
+                                # Use a scale factor to make the window smaller
+                                scale_factor = 0.9  # Reduce to 90% of original size
+                                display_width = int(frame.shape[1] * scale_factor)
+                                display_height = int(frame.shape[0] * scale_factor)
+                                display_frame = cv2.resize(frame, (display_width, display_height))
+                                
+                                # Display resized frame
+                                cv2.imshow('Video Stream', display_frame)
+                                
+                            except Exception as e:
+                                # If there's an error in the overlay drawing, still show the basic frame
+                                print(f"Error drawing overlays: {e}")
+                                # Fallback: show basic frame without overlays
+                                scale_factor = 0.9
+                                display_width = int(frame.shape[1] * scale_factor)
+                                display_height = int(frame.shape[0] * scale_factor)
+                                display_frame = cv2.resize(frame, (display_width, display_height))
+                                cv2.imshow('Video Stream', display_frame)
                         
-                        # Frame rate control and user input handling
+                        # Frame rate control and user input handling (constant frame pacing)
                         if not self.headless_mode:
                             # Synchronized frame rate control
                             current_time = time.time()
@@ -1782,10 +1926,11 @@ class VideoReceiver:
                                     # Audio is significantly ahead, slow down video very slightly
                                     target_delay = target_delay * 1.05
                             
-                            sleep_time = max(0.001, target_delay - elapsed)
+                            sleep_time = max(0.0, target_delay - elapsed)
                             
                             # Check for quit key with precise timing
-                            key = cv2.waitKey(int(sleep_time * 1000)) & 0xFF
+                            # Ensure at least 1ms waitKey to allow window events
+                            key = cv2.waitKey(max(1, int(sleep_time * 1000))) & 0xFF
                             if key == ord('q'):
                                 #logger.info("Quit requested by user")
                                 print("Quit requested by user")
@@ -1805,8 +1950,9 @@ class VideoReceiver:
                             current_time = time.time()
                             elapsed = current_time - last_frame_time
                             target_delay = frame_time
-                            sleep_time = max(0.001, target_delay - elapsed)
-                            time.sleep(sleep_time)
+                            sleep_time = max(0.0, target_delay - elapsed)
+                            if sleep_time > 0:
+                                time.sleep(sleep_time)
                             last_frame_time = time.time()
                             
                         # Log synchronization status periodically (reduced frequency)
