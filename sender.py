@@ -193,7 +193,8 @@ class VideoSender:
         
         try:
             while True:
-                loop_start_time = time.time()
+                # Use a monotonic clock for precise pacing
+                loop_start_time = time.perf_counter()
                 frame_count = 0
                 
                 # Reset video position
@@ -208,14 +209,16 @@ class VideoSender:
                 # Stream one complete video loop
                 while True:
                     # Maintain a constant frame rate by skipping/dropping frames when behind schedule
-                    elapsed_since_loop = time.time() - loop_start_time
+                    elapsed_since_loop = time.perf_counter() - loop_start_time
                     expected_index = int(elapsed_since_loop / frame_delay)
 
-                    # If we're behind, jump ahead to the expected frame index to keep real-time pace
+                    # If we're behind, drop frames efficiently using grab() to keep real-time pace
                     if expected_index > frame_count:
-                        # Fast seek to the expected frame index (drop frames)
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, min(expected_index, total_frames - 1))
-                        frame_count = expected_index
+                        frames_to_skip = min(expected_index - frame_count, max(0, total_frames - 1 - frame_count))
+                        for _ in range(frames_to_skip):
+                            # Grab without decode for speed
+                            cap.grab()
+                        frame_count += frames_to_skip
 
                     ret, frame = cap.read()
                     if not ret:
@@ -242,19 +245,22 @@ class VideoSender:
                     # Prepare frame data
                     frame_data = pickle.dumps(encoded_frame)
                     frame_size = len(frame_data)
-                    
-                    # Send frame size first, then frame data
+
+                    # Calculate presentation timestamp (PTS) relative to start of current loop
+                    pts = frame_count * frame_delay
+
+                    # Send frame header (PTS + size) and then frame data
                     try:
-                        self.client_socket.sendall(struct.pack("L", frame_size))
+                        self.client_socket.sendall(struct.pack("dL", pts, frame_size))
                         self.client_socket.sendall(frame_data)
                         
                         frame_count += 1
                         
-                        # Maintain real-time playback schedule for next frame
-                        elapsed_time = time.time() - loop_start_time
-                        next_frame_time = frame_count * frame_delay
-                        if next_frame_time > elapsed_time:
-                            time.sleep(next_frame_time - elapsed_time)
+                        # Maintain real-time playback schedule for next frame (high precision)
+                        next_frame_time = loop_start_time + frame_count * frame_delay
+                        now = time.perf_counter()
+                        if next_frame_time > now:
+                            time.sleep(next_frame_time - now)
                         
                     except (socket.error, ConnectionResetError):
                         print("Client disconnected")

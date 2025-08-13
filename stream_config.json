@@ -37,7 +37,7 @@
   },
   "video": {
     "target_fps": 24,
-    "jpeg_quality": 80,
+    "jpeg_quality": 60,
     "scale_factor": 0.9
   }
 }

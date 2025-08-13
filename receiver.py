@@ -77,25 +77,47 @@ class VideoReceiver:
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         
         # Audio socket and settings
-        self.audio_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.audio_enabled = self.config.get('audio', 'enabled') if self.config.get('audio') is not None else True
+        self.audio_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)  # Always create socket
         self.audio_playing = False
         self.audio_process = None  # FFplay process for audio playback
         
         # Audio-Video Synchronization from config
-        self.sync_enabled = self.config.get('audio_sync', 'enabled') if self.config.get('audio_sync') else True
+        self.sync_enabled = (self.config.get('audio_sync', 'enabled') if self.config.get('audio_sync') else True) and self.audio_enabled
         buffer_size = self.config.get('audio_sync', 'buffer_size') if self.config.get('audio_sync') else 10
-        self.audio_sync_queue = queue.Queue(maxsize=buffer_size)  # Buffer for audio chunks with timestamps
+        self.audio_sync_queue = queue.Queue(maxsize=buffer_size) if self.audio_enabled else queue.Queue(maxsize=0)
         self.video_sync_queue = queue.Queue(maxsize=buffer_size)  # Buffer for video frames with timestamps
         self.base_timestamp = None  # Reference timestamp for synchronization
         self.sync_lock = Lock()
         self.max_sync_drift = self.config.get('audio_sync', 'max_drift') if self.config.get('audio_sync') else 0.1
         self.audio_delay_compensation = self.config.get('audio_sync', 'delay_compensation') if self.config.get('audio_sync') else 0.0
-        self.max_compensation = 0.1  # Maximum compensation allowed (100ms)
+        self.max_compensation = 0.2  # Maximum compensation allowed (200ms)
+        # Cumulative timeline trackers for precise sync
+        self.audio_played_seconds = 0.0
+        self.video_last_pts = 0.0
+        self._prev_video_pts = None
+        self.current_av_drift = 0.0
+        self.dropped_frames = 0
+        # Drop threshold: if video lags behind audio more than this, skip frames
+        try:
+            self.drop_threshold = max(0.12, float(self.max_sync_drift) * 2.0)
+        except Exception:
+            self.drop_threshold = 0.12
         
         # Video receive/display buffering
         self.video_frame_queue = queue.Queue(maxsize=60)  # buffer of most recent frames
         self.video_running = False
         self.video_reader_thread = None
+        # Display loop control for exact output FPS
+        self.display_running = False
+        self.display_thread = None
+        self.display_lock = Lock()
+        self.latest_display_frame = None
+        self.latest_display_pts = 0.0
+        self.displayed_ticks = 0
+        self._quit = False
+        self.target_fps_display = None
+        self.frame_time_display = None
         
         # Initialize NSFW detection based on config
         self.nsfw_detection_available = False
@@ -295,7 +317,7 @@ class VideoReceiver:
         
         # Initialize Whisper for audio transcription based on config
         self.transcription_available = False
-        if self.config.is_enabled('transcription'):
+        if self.config.is_enabled('transcription') and self.audio_enabled:
             #logger.info("Initializing Whisper model for audio transcription...")
             try:
                 # Get transcription settings from config
@@ -314,7 +336,8 @@ class VideoReceiver:
                 self.last_subtitle_time = 0
                 self.audio_buffer = []
                 self.audio_buffer_duration = self.config.get('transcription', 'chunk_duration') or 2.0  # Smaller chunks for faster processing
-                self.last_transcription_time = time.time()
+                # Use a monotonic clock for transcription timing to match playback timing
+                self.last_transcription_time = time.perf_counter()
                 
                 # Initialize transcript file
                 with open(self.transcript_file, 'w', encoding='utf-8') as f:
@@ -366,7 +389,7 @@ class VideoReceiver:
             #logger.info("Started gun detection in background thread")
             
         # Start the audio transcription thread if available
-        if self.transcription_available:
+        if self.transcription_available and self.audio_enabled:
             self.transcription_running = True
             self.transcription_thread = threading.Thread(target=self._transcription_worker, daemon=True)
             self.transcription_thread.start()
@@ -503,16 +526,24 @@ class VideoReceiver:
             self.socket.connect((self.host, self.port))
             logger.info("Connected to video server!")
             
-            # Connect to audio stream
+            # Connect to audio stream (always connect, but may not process if disabled)
             logger.info(f"Connecting to audio server at {self.host}:{self.audio_port}...")
             self.audio_socket.connect((self.host, self.audio_port))
             logger.info("Connected to audio server!")
             
-            # Start audio playback thread
-            self.audio_playing = True
-            self.audio_thread = threading.Thread(target=self._audio_playback_worker, daemon=True)
-            self.audio_thread.start()
-            logger.info("Started audio playback thread")
+            # Start audio playback thread if audio is enabled
+            if self.audio_enabled:
+                self.audio_playing = True
+                self.audio_thread = threading.Thread(target=self._audio_playback_worker, daemon=True)
+                self.audio_thread.start()
+                logger.info("Started audio playback thread")
+            else:
+                logger.info("Audio disabled by configuration (--no-audio). Audio data will be consumed but not processed.")
+                # Start a dummy audio thread that just consumes data without playing
+                self.audio_playing = True
+                self.audio_thread = threading.Thread(target=self._audio_consumer_worker, daemon=True)
+                self.audio_thread.start()
+                logger.info("Started audio consumer thread (no playback/processing)")
             
             return True
         except Exception as e:
@@ -581,6 +612,7 @@ class VideoReceiver:
             # Start FFplay process for real-time audio playback
             ffplay_cmd = [
                 'ffplay', '-nodisp', '-autoexit',
+                '-fflags', 'nobuffer', '-flags', 'low_delay',
                 '-f', 's16le',  # 16-bit signed little-endian
                 '-ac', str(channels),  # channels
                 '-ar', str(sample_rate),      # sample rate
@@ -618,14 +650,14 @@ class VideoReceiver:
                         
                         if len(audio_data) == chunk_size:
                             # Calculate timing for this audio chunk
-                            current_time = time.time()
-                            
-                            # Initialize base timestamp on first chunk
+                            current_time = time.perf_counter()
+                            # Initialize base timestamp and counters on first chunk
                             with self.sync_lock:
                                 if self.base_timestamp is None:
                                     self.base_timestamp = current_time
+                                    self.audio_played_seconds = 0.0
                                     logger.info(f"Initialized synchronization base timestamp: {self.base_timestamp}")
-                            
+
                             # Calculate audio chunk duration
                             chunk_duration = len(audio_data) / bytes_per_second
                             
@@ -649,19 +681,22 @@ class VideoReceiver:
                                     except queue.Empty:
                                         pass
                             
-                            # Send audio data to FFplay (with limited sync compensation)
+                            # Send audio data to FFplay (paced to not outrun video)
                             if self.audio_process.stdin:
-                                # Apply very limited sync compensation to avoid audio disruption
-                                if abs(self.audio_delay_compensation) > 0.005:  # More than 5ms
-                                    if self.audio_delay_compensation > 0:
-                                        # Audio is ahead, add very small delay (max 50ms)
-                                        delay = min(self.audio_delay_compensation, 0.05)
-                                        if delay > 0.01:  # Only delay if significant
-                                            time.sleep(delay)
-                                    # If audio is behind, we don't add extra delays (let it catch up naturally)
-                                
+                                # If audio is running ahead of video, delay writes to keep them aligned
+                                if self.sync_enabled:
+                                    with self.sync_lock:
+                                        video_pts = self.video_last_pts or 0.0
+                                        audio_played = self.audio_played_seconds
+                                    drift = audio_played - video_pts  # positive => audio ahead
+                                    if drift > self.max_sync_drift:
+                                        time.sleep(min(drift, self.max_compensation))
+
                                 self.audio_process.stdin.write(audio_data)
                                 self.audio_process.stdin.flush()
+                                # Update cumulative audio timeline after successful write
+                                with self.sync_lock:
+                                    self.audio_played_seconds += chunk_duration
                                 
                                 # Buffer audio for transcription if available (always buffer regardless of sync)
                                 if self.transcription_available:
@@ -708,7 +743,7 @@ class VideoReceiver:
                             audio_data += packet
                         
                         # Still maintain timing for sync even without playback
-                        current_time = time.time()
+                        current_time = time.perf_counter()
                         with self.sync_lock:
                             if self.base_timestamp is None:
                                 self.base_timestamp = current_time
@@ -743,6 +778,53 @@ class VideoReceiver:
             logger.error(f"Error in audio playback thread: {e}")
         
         logger.info("Audio playback thread stopped")
+    
+    def _audio_consumer_worker(self):
+        """Background worker thread that consumes audio data but doesn't play it (for --no-audio mode)"""
+        logger.info("Audio consumer thread started (no processing)")
+        
+        try:
+            # Receive audio parameters (same as playback worker but don't use them)
+            header_len = struct.calcsize("L")
+            audio_params_size_bytes = self._recv_exact(self.audio_socket, header_len)
+            if not audio_params_size_bytes:
+                raise RuntimeError("Failed to read audio params header")
+            audio_params_size = struct.unpack("L", audio_params_size_bytes)[0]
+            audio_params_data = b""
+            while len(audio_params_data) < audio_params_size:
+                audio_params_data += self.audio_socket.recv(4096)
+            
+            audio_params = pickle.loads(audio_params_data)
+            logger.info(f"Received audio parameters (discarded): {audio_params}")
+            
+            # Just consume audio data without processing
+            while self.audio_playing:
+                try:
+                    # Get audio chunk size
+                    chunk_header = self._recv_exact(self.audio_socket, header_len)
+                    if not chunk_header:
+                        logger.error("Lost connection to audio server")
+                        break
+                    chunk_size = struct.unpack("L", chunk_header)[0]
+                    
+                    # Receive and discard audio data
+                    audio_data = b""
+                    while len(audio_data) < chunk_size:
+                        packet = self.audio_socket.recv(min(chunk_size - len(audio_data), 4096))
+                        if not packet:
+                            break
+                        audio_data += packet
+                    
+                    # Just discard the data - no playback, no transcription
+                    
+                except Exception as e:
+                    logger.error(f"Error during audio consumption: {e}")
+                    break
+            
+        except Exception as e:
+            logger.error(f"Error in audio consumer thread: {e}")
+        
+        logger.info("Audio consumer thread stopped")
     
     def _gun_detection_worker(self):
         """Background worker thread for local weapon detection processing"""
@@ -1454,13 +1536,14 @@ class VideoReceiver:
         
         try:
             while True:
-                # Receive frame size
-                while len(data) < payload_size:
+                # Receive frame header: PTS (double) + size (unsigned long)
+                header_len = struct.calcsize("dL")
+                while len(data) < header_len:
                     data += self.socket.recv(4096)
-                
-                packed_msg_size = data[:payload_size]
-                data = data[payload_size:]
-                msg_size = struct.unpack("L", packed_msg_size)[0]
+
+                packed_header = data[:header_len]
+                data = data[header_len:]
+                pts, msg_size = struct.unpack("dL", packed_header)
                 
                 # Receive frame data
                 while len(data) < msg_size:
@@ -1476,30 +1559,30 @@ class VideoReceiver:
                     
                     if frame is not None:
                         frame_count += 1
-                        current_time = time.time()
+                        current_time_perf = time.perf_counter()
                         
                         # Debug: Print frame info every 30 frames
                         if frame_count % 30 == 0:
                             print(f"Frame {frame_count}: shape={frame.shape}, dtype={frame.dtype}")
                         
-                        # Initialize or reinitialize base timestamp for synchronization at loop boundaries
+                        # Initialize or reinitialize base timestamp for synchronization at loop boundaries (use perf_counter)
                         with self.sync_lock:
                             if self.base_timestamp is None:
-                                self.base_timestamp = current_time
+                                self.base_timestamp = current_time_perf
                             # Detect likely video loop restart by large backwards jump in frame timing
                             elif self.video_sync_queue.qsize() > 0:
                                 try:
                                     last_video_time = self.video_sync_queue.queue[-1]['timestamp']
-                                    if current_time + 0.1 < last_video_time:  # timestamp went backwards notably
+                                    if current_time_perf + 0.1 < last_video_time:  # timestamp went backwards notably
                                         self._reset_sync(reason="Detected video timestamp jump (loop restart)")
                                 except Exception:
                                     pass
 
-                        # Store video frame timing for synchronization
+                        # Store video frame timing for synchronization (use perf_counter)
                         if self.sync_enabled:
                             try:
                                 self.video_sync_queue.put_nowait({
-                                    'timestamp': current_time,
+                                    'timestamp': current_time_perf,
                                     'frame_number': frame_count
                                 })
                             except queue.Full:
@@ -1507,7 +1590,7 @@ class VideoReceiver:
                                 try:
                                     self.video_sync_queue.get_nowait()
                                     self.video_sync_queue.put_nowait({
-                                        'timestamp': current_time,
+                                        'timestamp': current_time_perf,
                                         'frame_number': frame_count
                                     })
                                 except queue.Empty:
@@ -1516,6 +1599,10 @@ class VideoReceiver:
                         # Calculate and apply synchronization compensation
                         if self.sync_enabled:
                             self.audio_delay_compensation = self._calculate_sync_compensation()
+                        # Track latest PTS and compute drift for on-screen display and dropping
+                        with self.sync_lock:
+                            self.video_last_pts = pts
+                            self.current_av_drift = (self.audio_played_seconds - self.video_last_pts) if self.sync_enabled else 0.0
                         
                         # Check for NSFW content (rate limited by check_nsfw)
                         if self.nsfw_detection_available:
@@ -1880,7 +1967,7 @@ class VideoReceiver:
                                         sync_color = (0, 0, 255)  # Red for significant drift
                                     
                                     self.draw_icon(frame, icon_x, icon_y, "sync", sync_color, 20)
-                                    sync_text = f"Sync: {self.audio_delay_compensation:+.3f}s"
+                                    sync_text = f"Sync: {self.audio_delay_compensation:+.3f}s  Drift: {self.current_av_drift:+.3f}s  Drop: {self.dropped_frames}"
                                     cv2.putText(frame, sync_text, (info_start_x, current_info_y), 
                                                cv2.FONT_HERSHEY_DUPLEX, 0.7, sync_color, 2)
                                 else:
@@ -1907,30 +1994,34 @@ class VideoReceiver:
                                 display_frame = cv2.resize(frame, (display_width, display_height))
                                 cv2.imshow('Video Stream', display_frame)
                         
-                        # Frame rate control and user input handling (constant frame pacing)
+                        # Frame rate control and user input handling (constant frame pacing with PTS)
                         if not self.headless_mode:
-                            # Synchronized frame rate control
-                            current_time = time.time()
-                            elapsed = current_time - last_frame_time
-                            
-                            # Calculate target delay with minimal sync adjustment
-                            target_delay = frame_time
-                            
-                            # Apply only very small sync adjustments to avoid disruption
+                            # Use PTS to pace display precisely relative to loop start; drop if too late
+                            if frame_count == 1:
+                                # Initialize video loop start based on first frame arrival
+                                video_loop_start = time.perf_counter() - pts
+                            # Target display time for this frame
+                            target_time = video_loop_start + pts
+                            now = time.perf_counter()
+                            lateness = now - target_time
+                            # If this frame is too late and audio is ahead a lot, drop it
+                            if self.sync_enabled and lateness > self.drop_threshold and (self.current_av_drift > self.drop_threshold):
+                                self.dropped_frames += 1
+                                continue
+                            base_sleep = max(0.0, target_time - now)
+                            # If audio is behind significantly (negative drift), hold video to let audio catch up
+                            if self.sync_enabled and (self.current_av_drift < -self.drop_threshold):
+                                base_sleep = max(base_sleep, min(abs(self.current_av_drift), self.max_compensation))
+
+                            # Apply tiny sync nudge if necessary
                             if self.sync_enabled and abs(self.audio_delay_compensation) > 0.02:
-                                # Only apply very small video timing adjustments
                                 if self.audio_delay_compensation < -0.05:
-                                    # Audio is significantly behind, speed up video very slightly
-                                    target_delay = max(0.001, target_delay * 0.95)
+                                    base_sleep *= 0.95
                                 elif self.audio_delay_compensation > 0.05:
-                                    # Audio is significantly ahead, slow down video very slightly
-                                    target_delay = target_delay * 1.05
-                            
-                            sleep_time = max(0.0, target_delay - elapsed)
-                            
-                            # Check for quit key with precise timing
-                            # Ensure at least 1ms waitKey to allow window events
-                            key = cv2.waitKey(max(1, int(sleep_time * 1000))) & 0xFF
+                                    base_sleep *= 1.05
+
+                            # Ensure minimal wait for UI responsiveness
+                            key = cv2.waitKey(max(1, int(base_sleep * 1000))) & 0xFF
                             if key == ord('q'):
                                 #logger.info("Quit requested by user")
                                 print("Quit requested by user")
@@ -1946,11 +2037,19 @@ class VideoReceiver:
                                     
                             last_frame_time = time.time()
                         else:
-                            # In headless mode, just maintain frame timing without user input
-                            current_time = time.time()
-                            elapsed = current_time - last_frame_time
-                            target_delay = frame_time
-                            sleep_time = max(0.0, target_delay - elapsed)
+                            # In headless mode, pace using PTS and monotonic sleep; drop if too late
+                            if frame_count == 1:
+                                video_loop_start = time.perf_counter() - pts
+                            target_time = video_loop_start + pts
+                            now = time.perf_counter()
+                            lateness = now - target_time
+                            if self.sync_enabled and lateness > self.drop_threshold and (self.current_av_drift > self.drop_threshold):
+                                self.dropped_frames += 1
+                                continue
+                            sleep_time = max(0.0, target_time - now)
+                            # If audio is behind significantly, hold processing to let audio catch up
+                            if self.sync_enabled and (self.current_av_drift < -self.drop_threshold):
+                                sleep_time = max(sleep_time, min(abs(self.current_av_drift), self.max_compensation))
                             if sleep_time > 0:
                                 time.sleep(sleep_time)
                             last_frame_time = time.time()

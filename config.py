@@ -26,6 +26,9 @@ else:
 
 # Default configuration values with auto-detected optimal settings
 DEFAULT_CONFIG = {
+    "audio": {
+        "enabled": True
+    },
     "nsfw_detection": {
         "enabled": True,
         "time_interval": 0.5,  # Check every 0.5 seconds
@@ -62,9 +65,9 @@ DEFAULT_CONFIG = {
         "audio_port": 9998
     },
     "video": {
-        "target_fps": 24,
-        "jpeg_quality": 80,
-        "scale_factor": 0.9,
+        "target_fps": 25,
+        "jpeg_quality": 60,
+        "scale_factor": 0.5,
         "headless_mode": False  # Run without video display window
     }
 }
@@ -150,6 +153,8 @@ Examples:
     )
     
     # Feature toggles
+    parser.add_argument('--no-audio', action='store_true',
+                        help='Disable audio entirely (also disables sync and transcription)')
     parser.add_argument('--no-nsfw', action='store_true',
                         help='Disable NSFW detection')
     parser.add_argument('--no-gun', action='store_true',
@@ -213,6 +218,10 @@ def apply_cli_overrides(config: Config, args):
     """Apply command line argument overrides to configuration"""
     
     # Feature toggles (disable flags)
+    if args.no_audio:
+        config.set('audio', 'enabled', False)
+        config.set('audio_sync', 'enabled', False)
+        config.set('transcription', 'enabled', False)
     if args.no_nsfw:
         config.set('nsfw_detection', 'enabled', False)
     if args.no_gun:
