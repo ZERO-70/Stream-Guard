@@ -21,6 +21,8 @@ source enviroment/bin/activate && python receiver.py --no-nsfw --no-gun --no-tra
     
 source enviroment/bin/activate && python receiver.py --enable-nsfw --enable-gun --enable-transcription --enable-profanity --whisper-model small
 
+add --no-audio at the end if you want no audio
+
 ### Environment Setup
 
 ```bash

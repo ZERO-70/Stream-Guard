@@ -36,7 +36,7 @@
     "audio_port": 9998
   },
   "video": {
-    "target_fps": 24,
+    "target_fps": 30,
     "jpeg_quality": 60,
     "scale_factor": 0.9
   }
