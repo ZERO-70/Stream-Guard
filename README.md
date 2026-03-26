@@ -17,6 +17,14 @@ This project was created with the mutual contributions of ChatGPT, GitHub Copilo
 - **⚙️ Flexible configuration** via config files, command line, or interactive tool
 - **Graceful connection handling** and cleanup
 
+## Video Demo
+Note: The entire system runs locally and was designed for high-performance hardware (e.g., RTX 2080 or equivalent). The demonstration below, however, is executed on a low-end laptop without a dedicated GPU to showcase broader accessibility.
+
+
+https://github.com/user-attachments/assets/3bab3ff1-908a-4292-8394-28581cceecd4
+
+
+
 ## Quick Start
 
 ### Please See Commands.md for configurable commands.
