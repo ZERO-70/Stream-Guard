@@ -292,7 +292,7 @@ def blur_frame(self, frame, blur_strength=50):  # Increase for more blur
 
 - **OS**: prefered Linux Ubunutu gnome wayland , otherwise make changes accordingly.
 - **Python**: 3.11 or higher
-- **hardware**: At least 8GB RAM | 16GB recommended ,you do need a dedicated GPU.
+- **hardware**: At least 16GB RAM | 32GB recommended ,you do need a dedicated GPU (rtx 2080 recommended).
 - **Storage**: Enough space for your video file + 7 GB for dependencies.
 - **Internet**: Nope , unless you modify to take an actuall stream from internet other than the local stream.
 
