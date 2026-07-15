@@ -2,7 +2,7 @@
 
 This project implements a comprehensive video streaming system using Python sockets with configurable content detection features including NSFW detection, gun detection, audio transcription, and profanity detection. 
 
-This project was created with the mutual contributions of ChatGPT, GitHub Copilot, and the developer himmself.
+This project was created with the mutual contributions with AI tools.
 
 ## Features
 
